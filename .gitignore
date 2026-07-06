@@ -1,0 +1,5 @@
+node_modules/
+.env
+*.log
+check_schema.js
+build_full_code.js

@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="ro">
+<head>
+    <meta charset="UTF-8">
+    <title>Test Nutriție AI</title>
+    <style>
+        body { font-family: Arial, sans-serif; padding: 20px; max-width: 600px; margin: 0 auto; }
+        #rezultat { margin-top: 20px; white-space: pre-wrap; background: #f4f4f4; padding: 15px; border-radius: 5px;}
+    </style>
+</head>
+<body>
+    <h2>Încarcă o poză cu mâncare pentru Gemini</h2>
+    <input type="file" id="imagineInput" accept="image/*">
+    <button onclick="trimitePoza()">Analizează Mâncarea</button>
+    <div id="rezultat">Aștept imaginea...</div>
+
+    <script>
+        async function trimitePoza() {
+            const fisier = document.getElementById('imagineInput').files[0];
+            if (!fisier) return alert('Te rog să selectezi o imagine mai întâi!');
+
+            const rezultatDiv = document.getElementById('rezultat');
+            rezultatDiv.innerText = "Se analizează... (Gemini se gândește)";
+
+            const formData = new FormData();
+            formData.append('imagine', fisier);
+
+            try {
+                const response = await fetch('http://localhost:3000/api/analizeaza-mancare', {
+                    method: 'POST',
+                    body: formData
+                });
+                
+                const data = await response.json();
+                if (data.eroare) {
+                    rezultatDiv.innerText = "Eroare: " + data.eroare;
+                } else {
+                    rezultatDiv.innerText = data.date;
+                }
+            } catch (error) {
+                rezultatDiv.innerText = "A apărut o problemă la conectarea cu serverul.";
+            }
+        }
+    </script>
+</body>
+</html>
