@@ -218,42 +218,54 @@ Instrucțiuni de formatare și stil:
 
 Sarcina ta: Răspunde prietenos, ținând cont de istoricul discuției și de caloriile/proteinele rămase astăzi.`;
 
-    let contents = [];
+    const messages = [
+      { role: "system", content: systemPrompt }
+    ];
+
     if (Array.isArray(mesaje) && mesaje.length > 0) {
       const istoric = mesaje.slice(-10);
-      contents = istoric.map((m, idx) => {
-        let role = m.role === 'user' || m.sender === 'user' ? 'user' : 'model';
-        let text = m.text || m.content || '';
-        if (idx === istoric.length - 1) text = ultimulMesaj;
-        return { role, parts: [{ text }] };
+      istoric.forEach((m, idx) => {
+        let role = m.role === 'user' || m.sender === 'user' ? 'user' : 'assistant';
+        let content = m.text || m.content || '';
+        if (idx === istoric.length - 1) content = ultimulMesaj;
+        if (content.trim()) {
+          messages.push({ role, content });
+        }
       });
     } else {
-      contents = [{ role: 'user', parts: [{ text: ultimulMesaj }] }];
+      messages.push({ role: "user", content: ultimulMesaj });
     }
 
-    contents.unshift({ role: 'user', parts: [{ text: systemPrompt }] });
-    contents.splice(1, 0, { role: 'model', parts: [{ text: "Am înțeles contextul și regulile NutriAI. Cu ce te pot ajuta?" }] });
+    const deepseekApiKey = process.env.DEEPSEEK_API_KEY || "sk-f53cb4b9473d4a1c8cab1667c5e740a7";
+    
+    const fetchPromise = fetch("https://api.deepseek.com/chat/completions", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${deepseekApiKey}`
+      },
+      body: JSON.stringify({
+        model: "deepseek-chat",
+        messages: messages,
+        temperature: 0.7,
+        max_tokens: 800
+      })
+    });
 
-    // Filtrăm și unim mesajele consecutive cu același rol (user/model) pentru a respecta cerința strictă Gemini API
-    const validContents = [];
-    for (const item of contents) {
-      if (!item.parts || !item.parts[0] || !item.parts[0].text.trim()) continue;
-      if (validContents.length > 0 && validContents[validContents.length - 1].role === item.role) {
-        validContents[validContents.length - 1].parts[0].text += "\n\n" + item.parts[0].text;
-      } else {
-        validContents.push({ role: item.role, parts: [{ text: item.parts[0].text }] });
-      }
+    const response = await callWithTimeout(fetchPromise, 35000);
+    if (!response.ok) {
+      const errorText = await response.text();
+      throw new Error(`Eroare DeepSeek API (${response.status}): ${errorText}`);
     }
 
-    const responsePromise = modelGemini.generateContent({ contents: validContents });
-    const result = await callWithTimeout(responsePromise);
-    const raspunsText = result.response.text();
+    const data = await response.json();
+    const raspunsText = data.choices && data.choices[0] && data.choices[0].message ? data.choices[0].message.content : "Nu am putut genera un răspuns.";
     
     res.json({ raspuns: raspunsText });
     
   } catch (error) {
-    console.error("Eroare la generarea chat-ului Gemini:", error);
-    res.status(500).json({ raspuns: `Eroare AI: ${error.message || "Problema de conexiune cu serverul AI. Mai încearcă!"}` });
+    console.error("Eroare la generarea chat-ului DeepSeek:", error);
+    res.status(500).json({ raspuns: `Eroare AI (DeepSeek): ${error.message || "Problema de conexiune cu serverul AI. Mai încearcă!"}` });
   }
 });
 
