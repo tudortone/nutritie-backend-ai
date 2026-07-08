@@ -17,10 +17,16 @@ const supabaseUrl = process.env.SUPABASE_URL;
 const supabaseAnonKey = process.env.SUPABASE_ANON_KEY;
 const geminiApiKey = process.env.GEMINI_API_KEY;
 const groqApiKey = process.env.GROQ_API_KEY;
-const corsOriginsEnv = process.env.CORS_ORIGINS;
+const corsOriginsEnv = process.env.CORS_ORIGINS || '*';
 
-if (!supabaseUrl || !supabaseAnonKey || !geminiApiKey || !groqApiKey || !corsOriginsEnv) {
-  console.error("EROARE CRITICĂ: Lipsesc variabilele de mediu obligatorii (SUPABASE_URL, SUPABASE_ANON_KEY, GEMINI_API_KEY, GROQ_API_KEY sau CORS_ORIGINS).");
+const missingVars = [];
+if (!supabaseUrl) missingVars.push('SUPABASE_URL');
+if (!supabaseAnonKey) missingVars.push('SUPABASE_ANON_KEY');
+if (!geminiApiKey) missingVars.push('GEMINI_API_KEY');
+if (!groqApiKey) missingVars.push('GROQ_API_KEY');
+
+if (missingVars.length > 0) {
+  console.error(`EROARE CRITICĂ: Lipsesc variabilele de mediu obligatorii: ${missingVars.join(', ')}`);
   process.exit(1);
 }
 
@@ -154,10 +160,10 @@ const genAI = new GoogleGenerativeAI(geminiApiKey);
 const getGeminiModelsList = () => {
   return [
     process.env.GEMINI_MODEL,
-    "gemini-2.5-flash",
-    "gemini-2.0-flash",
-    "gemini-2.5-pro",
-    "gemini-flash-latest"
+    "gemini-1.5-flash",
+    "gemini-1.5-flash-latest",
+    "gemini-1.5-pro",
+    "gemini-2.0-flash-exp"
   ].filter((v, i, a) => v && a.indexOf(v) === i);
 };
 
@@ -449,6 +455,31 @@ app.post('/api/estimeaza-mancare-text', requireAuth, aiRateLimiter, async (req, 
   } catch (error) {
     console.error("Eroare estimare AI aliment:", error.message);
     res.status(500).json({ eroare: "Nu s-a putut estima alimentul cu AI." });
+  }
+});
+
+// ==========================================
+// RUTA 2.1 (C3): PROXY PENTRU OPENFOODFACTS BARCODE
+// ==========================================
+app.get('/api/produs-barcode/:code', requireAuth, async (req, res) => {
+  try {
+    const code = (req.params.code || '').trim();
+    if (!code) return res.status(400).json({ eroare: "Cod de bare invalid." });
+
+    const fetchPromise = fetch(`https://world.openfoodfacts.org/api/v2/product/${code}.json`, {
+      headers: { 'User-Agent': 'NutriAI - React Native App - Contact: tudortone' }
+    });
+    const resp = await callWithTimeout(fetchPromise, 12000);
+    if (!resp.ok) return res.status(404).json({ eroare: "Produs negăsit." });
+
+    const data = await resp.json();
+    if (data.status !== 1 || !data.product) {
+      return res.status(404).json({ eroare: "Produs negăsit în OpenFoodFacts." });
+    }
+    res.json(data.product);
+  } catch (err) {
+    console.error("Eroare interogare barcode OpenFoodFacts proxy:", err.message);
+    res.status(500).json({ eroare: "Eroare la interogarea codului de bare." });
   }
 });
 
