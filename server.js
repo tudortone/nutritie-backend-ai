@@ -1,9 +1,14 @@
 const express = require('express');
 const cors = require('cors');
+const helmet = require('helmet');
+const compression = require('compression');
 const multer = require('multer');
 const rateLimit = require('express-rate-limit');
 const { GoogleGenerativeAI } = require('@google/generative-ai');
 const { createClient } = require('@supabase/supabase-js');
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
 
 require('dotenv').config();
 
@@ -11,17 +16,21 @@ require('dotenv').config();
 const supabaseUrl = process.env.SUPABASE_URL;
 const supabaseAnonKey = process.env.SUPABASE_ANON_KEY;
 const geminiApiKey = process.env.GEMINI_API_KEY;
+const groqApiKey = process.env.GROQ_API_KEY;
+const corsOriginsEnv = process.env.CORS_ORIGINS;
 
-if (!supabaseUrl || !supabaseAnonKey || !geminiApiKey) {
-  console.error("ERRORE CRITICĂ: Lipsesc variabilele de mediu obligatorii (SUPABASE_URL, SUPABASE_ANON_KEY sau GEMINI_API_KEY).");
+if (!supabaseUrl || !supabaseAnonKey || !geminiApiKey || !groqApiKey || !corsOriginsEnv) {
+  console.error("EROARE CRITICĂ: Lipsesc variabilele de mediu obligatorii (SUPABASE_URL, SUPABASE_ANON_KEY, GEMINI_API_KEY, GROQ_API_KEY sau CORS_ORIGINS).");
   process.exit(1);
 }
 
 const app = express();
+app.set('trust proxy', 1);
+app.use(helmet());
+app.use(compression());
 const port = process.env.PORT || 3000;
 
 // 1.3 CORS Securizat și restrictiv
-const corsOriginsEnv = process.env.CORS_ORIGINS || '*';
 const corsOrigins = corsOriginsEnv.split(',').map(o => o.trim());
 
 app.use(cors({
@@ -33,19 +42,38 @@ app.use(cors({
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// 1.4 Rate Limiting pe endpoint-urile AI
-const aiLimiter = rateLimit({
+// Rate Limiting general pentru API
+const generalLimiter = rateLimit({
   windowMs: 15 * 60 * 1000, // 15 minute
-  max: 30, // max 30 cereri per fereastră per IP
+  max: 100, // max 100 cereri per fereastră per IP
   message: { eroare: "Prea multe cereri. Încearcă mai târziu." },
   standardHeaders: true,
   legacyHeaders: false,
 });
-app.use('/api/', aiLimiter);
+app.use('/api/', generalLimiter);
 
-// Upload limitat și filtrare MIME Type
+// 1.4 Rate Limiting strict pentru endpoint-urile AI (15 cereri pe minut)
+const aiRateLimiter = rateLimit({
+  windowMs: 1 * 60 * 1000, // 1 minut
+  max: 15, // max 15 cereri per minut per IP
+  message: { eroare: "Ai depășit limita de 15 cereri pe minut pentru AI. Te rugăm să aștepți un minut." },
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
+// Upload pe disc temporar pentru prevenirea OOM (Out of Memory)
+const storage = multer.diskStorage({
+  destination: (req, file, cb) => {
+    cb(null, os.tmpdir());
+  },
+  filename: (req, file, cb) => {
+    const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
+    cb(null, 'nutri-' + uniqueSuffix + path.extname(file.originalname || '.jpg'));
+  }
+});
+
 const upload = multer({ 
-  storage: multer.memoryStorage(),
+  storage: storage,
   limits: { fileSize: 5 * 1024 * 1024 }, // 5MB
   fileFilter: (req, file, cb) => {
     const validTypes = ['image/jpeg', 'image/png', 'image/webp'];
@@ -57,28 +85,63 @@ const upload = multer({
   }
 });
 
-// Inițializare Supabase pentru validarea token-ului JWT
+// Inițializare Supabase pentru validarea token-ului JWT și operațiuni DB sigure
 const supabase = createClient(supabaseUrl, supabaseAnonKey);
+const supabaseServiceKey = process.env.SUPABASE_SERVICE_ROLE_KEY || supabaseAnonKey;
+const supabaseAdmin = createClient(supabaseUrl, supabaseServiceKey);
 
-// Middleware Autentificare
+// Cache in-memory TTL (60 secunde) pentru token-uri JWT
+const tokenCache = new Map();
+const CACHE_TTL_MS = 60 * 1000;
+setInterval(() => {
+  const now = Date.now();
+  for (const [token, data] of tokenCache.entries()) {
+    if (now > data.expiresAt) tokenCache.delete(token);
+  }
+}, 5 * 60 * 1000).unref();
+
+// Helper pentru validarea magic bytes ale imaginilor
+const validateImageMagicBytes = (buffer) => {
+  if (!buffer || buffer.length < 12) return false;
+  // JPEG (FF D8 FF)
+  if (buffer[0] === 0xFF && buffer[1] === 0xD8 && buffer[2] === 0xFF) return true;
+  // PNG (89 50 4E 47)
+  if (buffer[0] === 0x89 && buffer[1] === 0x50 && buffer[2] === 0x4E && buffer[3] === 0x47) return true;
+  // WEBP (RIFF....WEBP)
+  if (buffer.toString('ascii', 0, 4) === 'RIFF' && buffer.toString('ascii', 8, 12) === 'WEBP') return true;
+  return false;
+};
+
+// Middleware Autentificare cu Cache TTL
 const requireAuth = async (req, res, next) => {
   if (req.method === 'OPTIONS') {
     return next();
   }
   
   const authHeader = req.headers.authorization;
-  console.log("=== Incoming Request ===");
-  console.log("Method:", req.method);
+  if (process.env.NODE_ENV === 'development') {
+    console.log("=== Incoming Request ===");
+    console.log("Method:", req.method);
+  }
   
   if (!authHeader || !authHeader.startsWith('Bearer ')) {
     return res.status(401).json({ eroare: "Acces neautorizat. Token lipsă." });
   }
   const token = authHeader.split(' ')[1];
+  const now = Date.now();
+  const cached = tokenCache.get(token);
+  if (cached && now < cached.expiresAt) {
+    req.user = cached.user;
+    return next();
+  }
+
   try {
     const { data: { user }, error } = await supabase.auth.getUser(token);
     if (error || !user) {
+      tokenCache.delete(token);
       return res.status(401).json({ eroare: "Token invalid sau expirat." });
     }
+    tokenCache.set(token, { user, expiresAt: now + CACHE_TTL_MS });
     req.user = user;
     next();
   } catch (error) {
@@ -86,9 +149,17 @@ const requireAuth = async (req, res, next) => {
   }
 };
 
-// Inițializare AI Gemini - model stabil gemini-2.0-flash
+// Inițializare AI Gemini și listă modele în cascadă (modele stabile prioritar)
 const genAI = new GoogleGenerativeAI(geminiApiKey);
-const modelGemini = genAI.getGenerativeModel({ model: process.env.GEMINI_MODEL || "gemini-2.0-flash" });
+const getGeminiModelsList = () => {
+  return [
+    process.env.GEMINI_MODEL,
+    "gemini-2.5-flash",
+    "gemini-2.0-flash",
+    "gemini-1.5-flash",
+    "gemini-1.5-pro"
+  ].filter((v, i, a) => v && a.indexOf(v) === i);
+};
 
 // Helper pentru timeout cereri Gemini (30 secunde)
 const callWithTimeout = (promise, ms = 30000) => {
@@ -103,30 +174,41 @@ const callWithTimeout = (promise, ms = 30000) => {
 // ==========================================
 app.get('/', (req, res) => {
   res.json({
-    nume: "NutriAI Backend Server",
-    status: "online",
-    versiune: "1.0.0",
-    mesaj: "Serverul AI și Supabase funcționează corect!"
+    status: "OK",
+    service: "NutriAI Secure Backend",
+    version: "2.1.0-secured",
+    timestamp: new Date().toISOString()
   });
 });
 
 app.get('/health', (req, res) => {
-  res.json({ status: 'ok', timestamp: new Date().toISOString() });
+  res.status(200).json({ status: 'ok', healthy: true, uptime: process.uptime(), timestamp: new Date().toISOString() });
 });
 
 // ==========================================
-// RUTA 1: ANALIZA FOTO STRUCTURATĂ (GEMINI)
-// Securizată cu requireAuth
+// RUTE API PROTEJATE CU JWT
 // ==========================================
-app.post('/api/analizeaza-mancare-structurat', requireAuth, upload.single('imagine'), async (req, res) => {
+
+// RUTA 1: ANALIZA FOTO STRUCTURATĂ (GEMINI)
+const handleAnalizaFoto = async (req, res) => {
   try {
     if (!req.file) {
-      return res.status(400).json({ eroare: "Nu s-a primit nicio imagine." });
+      return res.status(400).json({ eroare: "Te rog încarcă o imagine." });
+    }
+
+    // 1.1 Validare strictă mimetype (trebuie să fie imagine) înainte de a apela Gemini
+    if (!req.file.mimetype || !req.file.mimetype.startsWith('image/')) {
+      return res.status(400).json({ eroare: "Tip fișier nepermis. Doar fișierele de tip imagine sunt acceptate." });
+    }
+
+    const fileBuffer = await fs.promises.readFile(req.file.path);
+    if (!validateImageMagicBytes(fileBuffer)) {
+      return res.status(400).json({ eroare: "Tip fișier nepermis. Doar imagini JPEG/PNG/WEBP sunt acceptate." });
     }
 
     const imagePart = {
       inlineData: {
-        data: req.file.buffer.toString("base64"),
+        data: fileBuffer.toString("base64"),
         mimeType: req.file.mimetype
       },
     };
@@ -147,12 +229,31 @@ RETURNEAZĂ DOAR UN ARRAY JSON în următorul format (fără text înainte sau d
   }
 ]`;
 
-    const responsePromise = modelGemini.generateContent({
-      contents: [{ role: "user", parts: [{ text: prompt }, imagePart] }],
-      generationConfig: { responseMimeType: "application/json" }
-    });
-    
-    const result = await callWithTimeout(responsePromise);
+    let result = null;
+    let lastError = null;
+    const modelsToTry = getGeminiModelsList();
+
+    for (const modelName of modelsToTry) {
+      try {
+        const model = genAI.getGenerativeModel({ model: modelName });
+        const responsePromise = model.generateContent({
+          contents: [{ role: "user", parts: [{ text: prompt }, imagePart] }],
+          generationConfig: { responseMimeType: "application/json" }
+        });
+        result = await callWithTimeout(responsePromise);
+        if (result && result.response) {
+          console.log(`✅ Succes Gemini cu modelul: ${modelName}`);
+          break;
+        }
+      } catch (err) {
+        lastError = err;
+        console.warn(`⚠️ Încercare model [${modelName}] eșuată:`, err.message ? err.message.substring(0, 120) : err);
+      }
+    }
+
+    if (!result || !result.response) {
+      throw lastError || new Error("Toate modelele Gemini au eșuat. Verifică valabilitatea cheii API în .env.");
+    }
     const text = result.response.text();
 
     let parsed;
@@ -174,20 +275,46 @@ RETURNEAZĂ DOAR UN ARRAY JSON în următorul format (fără text înainte sau d
        parsed = [parsed]; // Fallback in caz ca returneaza obiect in loc de array
     }
 
-    res.json(parsed);
+    // Schema de validare / normalizare
+    const validated = parsed.map(item => ({
+      nume: String(item.nume || "Aliment necunoscut"),
+      estimare_grame: Number(item.estimare_grame) || 100,
+      calorii_per_100g: Number(item.calorii_per_100g) || 0,
+      proteine_per_100g: Number(item.proteine_per_100g) || 0,
+      grasimi_per_100g: Number(item.grasimi_per_100g) || 0,
+      carbohidrati_per_100g: Number(item.carbohidrati_per_100g) || 0,
+      incredere: String(item.incredere || "mediu")
+    }));
+
+    res.json(validated);
   } catch (error) {
     console.error("Eroare Gemini structurat:", error.message);
     res.status(500).json({ eroare: "Eroare la procesarea imaginii prin Gemini." });
+  } finally {
+    // 1.2 Ștergerea asincronă a fișierului temporar în blocul finally
+    if (req.file && req.file.path) {
+      fs.promises.unlink(req.file.path).catch(() => {});
+    }
   }
-});
+};
+
+app.post("/api/analiza-foto", requireAuth, aiRateLimiter, upload.single("imagine"), handleAnalizaFoto);
+app.post("/api/analizeaza-mancare-structurat", requireAuth, aiRateLimiter, upload.single("imagine"), handleAnalizaFoto);
 
 // ==========================================
-// RUTA 2: CHAT CONVERSAȚIONAL (GEMINI)
+// RUTA 2: CHAT CONVERSAȚIONAL (GROQ / LLAMA 3.3)
 // Securizată cu requireAuth
 // ==========================================
-app.post('/api/chat', requireAuth, async (req, res) => {
+app.post('/api/chat', requireAuth, aiRateLimiter, async (req, res) => {
   try {
+    if (!req.body || typeof req.body !== 'object') {
+      return res.status(400).json({ raspuns: "Format cerere invalid. Se așteaptă un obiect JSON." });
+    }
     let { mesaj, mesaje, caloriiConsumate, caloriiTinta, proteineConsumate, proteineTinta } = req.body;
+    const calCons = Number(caloriiConsumate) || 0;
+    const calTinta = Number(caloriiTinta) || 2000;
+    const protCons = Number(proteineConsumate) || 0;
+    const protTinta = Number(proteineTinta) || 150;
 
     let ultimulMesaj = mesaj;
     if (Array.isArray(mesaje) && mesaje.length > 0) {
@@ -208,8 +335,8 @@ REGULA TA PRINCIPALĂ: Răspunde STRICT și EXCLUSIV la întrebări despre nutri
 Dacă utilizatorul te întreabă absolut orice altceva (programare, politică, cultură generală, mașini, glume, istorie etc.), trebuie să REFUZI POLITICOS și să îi amintești că ești setat doar pentru discuții despre sănătate și nutriție.
 
 Contextul utilizatorului de astăzi:
-- Calorii: a mâncat ${caloriiConsumate || 0} dintr-o țintă de ${caloriiTinta || 2000} kcal.
-- Proteine: a mâncat ${proteineConsumate || 0}g dintr-o țintă de ${proteineTinta || 150}g.
+- Calorii: a mâncat ${calCons} dintr-o țintă de ${calTinta} kcal.
+- Proteine: a mâncat ${protCons}g dintr-o țintă de ${protTinta}g.
 
 Instrucțiuni de formatare și stil:
 1. Folosește emoji-uri relevante la începutul propozițiilor sau ideilor importante (de exemplu 🥗, 🔥, 🥩, 💡, ✅).
@@ -236,16 +363,23 @@ Sarcina ta: Răspunde prietenos, ținând cont de istoricul discuției și de ca
       messages.push({ role: "user", content: ultimulMesaj });
     }
 
-    const deepseekApiKey = process.env.DEEPSEEK_API_KEY || "sk-f53cb4b9473d4a1c8cab1667c5e740a7";
-    
-    const fetchPromise = fetch("https://api.deepseek.com/chat/completions", {
+    // 1.3 Limitare istoric conversație Groq bazată pe estimare de tokens (caractere / 3.5)
+    // Păstrăm maximum 6000 de tokens, asigurându-ne că primul mesaj (System Prompt) rămâne mereu la indexul 0.
+    const getEstimatedTokens = (arr) => arr.reduce((acc, m) => acc + Math.ceil((m.content ? m.content.length : 0) / 3.5), 0);
+    let totalTokens = getEstimatedTokens(messages);
+    while (totalTokens > 6000 && messages.length > 2) {
+      messages.splice(1, 1);
+      totalTokens = getEstimatedTokens(messages);
+    }
+
+    const fetchPromise = fetch("https://api.groq.com/openai/v1/chat/completions", {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        "Authorization": `Bearer ${deepseekApiKey}`
+        "Authorization": `Bearer ${groqApiKey}`
       },
       body: JSON.stringify({
-        model: "deepseek-chat",
+        model: "llama-3.3-70b-versatile",
         messages: messages,
         temperature: 0.7,
         max_tokens: 800
@@ -255,7 +389,7 @@ Sarcina ta: Răspunde prietenos, ținând cont de istoricul discuției și de ca
     const response = await callWithTimeout(fetchPromise, 35000);
     if (!response.ok) {
       const errorText = await response.text();
-      throw new Error(`Eroare DeepSeek API (${response.status}): ${errorText}`);
+      throw new Error(`Eroare Groq API (${response.status}): ${errorText}`);
     }
 
     const data = await response.json();
@@ -264,8 +398,57 @@ Sarcina ta: Răspunde prietenos, ținând cont de istoricul discuției și de ca
     res.json({ raspuns: raspunsText });
     
   } catch (error) {
-    console.error("Eroare la generarea chat-ului DeepSeek:", error);
-    res.status(500).json({ raspuns: `Eroare AI (DeepSeek): ${error.message || "Problema de conexiune cu serverul AI. Mai încearcă!"}` });
+    console.error("Eroare la generarea chat-ului Groq:", error);
+    res.status(500).json({ raspuns: "A apărut o problemă de conexiune cu asistentul AI. Te rugăm să mai încerci peste câteva momente!" });
+  }
+});
+
+// ==========================================
+// ==========================================
+// RUTA: ESTIMARE RAPIDĂ TEXT ALIMENT (GROQ/LLM)
+// ==========================================
+app.post('/api/estimeaza-mancare-text', requireAuth, aiRateLimiter, async (req, res) => {
+  try {
+    const { text } = req.body;
+    if (!text || typeof text !== 'string') return res.status(400).json({ eroare: "Text invalid." });
+    let curatat = text.replace(/[\x00-\x1F\x7F]/g, "").trim();
+    if (curatat.length > 200) curatat = curatat.substring(0, 200);
+    if (!curatat) return res.status(400).json({ eroare: "Text invalid." });
+    
+    const prompt = `Estimează valorile nutriționale pentru 1 porție standard din: "${curatat}". RETURNEAZĂ STRICT UN OBIECT JSON în formatul: {"nume": "${curatat}", "calorii": 300, "proteine": 15, "carbohidrati": 30, "grasimi": 10, "gramajDefault": 150}. Fără text adițional.`;
+    
+    const fetchPromise = fetch("https://api.groq.com/openai/v1/chat/completions", {
+      method: "POST",
+      headers: { "Authorization": `Bearer ${groqApiKey}`, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: "llama-3.3-70b-versatile",
+        messages: [{ role: "user", content: prompt }],
+        temperature: 0.2,
+        response_format: { type: "json_object" }
+      })
+    });
+    const groqResponse = await callWithTimeout(fetchPromise, 25000);
+    if (!groqResponse.ok) {
+      throw new Error(`Eroare Groq API (${groqResponse.status})`);
+    }
+    const data = await groqResponse.json();
+    const content = data.choices?.[0]?.message?.content;
+    if (!content) throw new Error("Răspuns gol primit de la AI.");
+    let parsed;
+    try {
+      parsed = JSON.parse(content);
+    } catch (e) {
+      const jsonMatch = content.match(/\{[\s\S]*\}/);
+      if (jsonMatch) {
+        parsed = JSON.parse(jsonMatch[0]);
+      } else {
+        throw new Error("Nu s-a putut interpreta răspunsul ca JSON.");
+      }
+    }
+    res.json(parsed);
+  } catch (error) {
+    console.error("Eroare estimare AI aliment:", error.message);
+    res.status(500).json({ eroare: "Nu s-a putut estima alimentul cu AI." });
   }
 });
 
@@ -330,7 +513,11 @@ app.post('/api/calculeaza-profil', requireAuth, async (req, res) => {
     const protPerKg = obiectiv === 'Menținere' ? 1.6 : 2.0;
     const proteineTinta = Math.round(g * protPerKg);
     
-    res.json({ caloriiTinta: Math.round(caloriiTinta), proteineTinta });
+    const calT = Math.round(caloriiTinta);
+    const grasimiTinta = Math.round((calT * 0.25) / 9); // 25% din calorii, 9 kcal/g
+    const carbiTinta = Math.round(Math.max((calT - (proteineTinta * 4) - (grasimiTinta * 9)) / 4, 50));
+    
+    res.json({ caloriiTinta: calT, proteineTinta, grasimiTinta, carbiTinta });
     
   } catch (error) {
     console.error("Eroare la calculul profilului:", error.message);
@@ -339,14 +526,59 @@ app.post('/api/calculeaza-profil', requireAuth, async (req, res) => {
 });
 
 // ==========================================
+// RUTA 4: ȘTERGERE MASĂ
+// ==========================================
+app.delete('/api/mese/:id', requireAuth, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { error } = await supabaseAdmin.from('mese').delete().eq('id', id).eq('user_id', req.user.id);
+    if (error) return res.status(500).json({ eroare: error.message });
+    res.json({ succes: true });
+  } catch (error) {
+    res.status(500).json({ eroare: "Eroare la ștergerea mesei." });
+  }
+});
+
+// ==========================================
+// RUTA 5: EDITARE MASĂ
+// ==========================================
+app.put('/api/mese/:id', requireAuth, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { nume, calorii, proteine, grasimi, carbohidrati } = req.body;
+    const { data, error } = await supabaseAdmin
+      .from('mese')
+      .update({ nume, calorii: Number(calorii), proteine: Number(proteine), grasimi: Number(grasimi), carbohidrati: Number(carbohidrati) })
+      .eq('id', id)
+      .eq('user_id', req.user.id)
+      .select();
+    if (error) return res.status(500).json({ eroare: error.message });
+    res.json({ succes: true, masa: data[0] });
+  } catch (error) {
+    res.status(500).json({ eroare: "Eroare la actualizarea mesei." });
+  }
+});
+
+// ==========================================
+// HANDLER 404 PENTRU RUTE INEXISTENTE
+// ==========================================
+app.use((req, res, next) => {
+  res.status(404).json({ eroare: "Ruta solicitată nu există (404)." });
+});
+
+// ==========================================
 // HANDLER GLOBAL DE ERORI
 // ==========================================
 app.use((err, req, res, next) => {
-  console.error("Eroare globală:", err.message);
-  if (err.message.includes('Tip fișier nepermis')) {
-    return res.status(415).json({ eroare: err.message });
+  const message = err?.message || '';
+  console.error("Eroare globală:", message);
+  if (err instanceof multer.MulterError) {
+    return res.status(400).json({ eroare: message });
   }
-  if (err.code === 'LIMIT_FILE_SIZE') {
+  if (message.includes('Tip fișier nepermis')) {
+    return res.status(400).json({ eroare: message });
+  }
+  if (err?.code === 'LIMIT_FILE_SIZE') {
     return res.status(413).json({ eroare: "Fișierul este prea mare. Limita este 5MB." });
   }
   res.status(500).json({ eroare: "Eroare internă a serverului." });

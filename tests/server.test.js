@@ -103,4 +103,15 @@ describe('Backend API Tests', () => {
       expect(res.body.eroare).toContain('Sexul selectat este invalid');
     });
   });
+
+  describe('Validări Faza 1 /api/analizeaza-mancare-structurat', () => {
+    it('ar trebui să returneze 400 dacă fișierul nu este o imagine (ex: .txt)', async () => {
+      const res = await request(app)
+        .post('/api/analizeaza-mancare-structurat')
+        .set('Authorization', 'Bearer token_valid')
+        .attach('imagine', Buffer.from('text periculos de test'), { filename: 'test.txt', contentType: 'text/plain' });
+      expect(res.statusCode).toBe(400);
+      expect(res.body.eroare).toContain('Tip fișier nepermis');
+    });
+  });
 });
