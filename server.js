@@ -78,7 +78,7 @@ const storage = multer.diskStorage({
   }
 });
 
-const upload = multer({ 
+const upload = multer({
   storage: storage,
   limits: { fileSize: 5 * 1024 * 1024 }, // 5MB
   fileFilter: (req, file, cb) => {
@@ -126,13 +126,13 @@ const requireAuth = async (req, res, next) => {
   if (req.method === 'OPTIONS') {
     return next();
   }
-  
+
   const authHeader = req.headers.authorization;
   if (process.env.NODE_ENV === 'development') {
     console.log("=== Incoming Request ===");
     console.log("Method:", req.method);
   }
-  
+
   if (!authHeader || !authHeader.startsWith('Bearer ')) {
     return res.status(401).json({ eroare: "Acces neautorizat. Token lipsă." });
   }
@@ -162,12 +162,10 @@ const requireAuth = async (req, res, next) => {
 const genAI = new GoogleGenerativeAI(geminiApiKey);
 const getGeminiModelsList = () => {
   return [
-    process.env.GEMINI_MODEL,
+    "gemini-2.5-flash",
     "gemini-2.0-flash",
-    "gemini-2.0-flash-lite",
-    "gemini-1.5-flash",
-    "gemini-1.5-pro"
-  ].filter((v, i, a) => v && a.indexOf(v) === i);
+    "gemini-2.0-flash-lite"
+  ];
 };
 
 // Helper pentru timeout cereri Gemini (30 secunde)
@@ -425,7 +423,7 @@ RETURNEAZĂ DOAR UN ARRAY JSON în următorul format (fără text înainte sau d
                 break;
               }
             }
-          } catch (e) {}
+          } catch (e) { }
         }
       }
     }
@@ -495,7 +493,7 @@ RETURNEAZĂ DOAR UN ARRAY JSON în următorul format (fără text înainte sau d
   } finally {
     // 1.2 Ștergerea asincronă a fișierului temporar în blocul finally
     if (req.file && req.file.path) {
-      fs.promises.unlink(req.file.path).catch(() => {});
+      fs.promises.unlink(req.file.path).catch(() => { });
     }
   }
 };
@@ -602,9 +600,9 @@ Sarcina ta: Răspunde prietenos, ținând cont de istoricul discuției și de ca
 
     const data = await response.json();
     const raspunsText = data.choices && data.choices[0] && data.choices[0].message ? data.choices[0].message.content : "Nu am putut genera un răspuns.";
-    
+
     res.json({ raspuns: raspunsText });
-    
+
   } catch (error) {
     console.error("Eroare la generarea chat-ului Groq:", error);
     res.status(500).json({ raspuns: "A apărut o problemă de conexiune cu asistentul AI. Te rugăm să mai încerci peste câteva momente!" });
@@ -691,9 +689,9 @@ app.post('/api/estimeaza-mancare-text', requireAuth, aiRateLimiter, async (req, 
     let curatat = text.replace(/[\x00-\x1F\x7F]/g, "").trim();
     if (curatat.length > 200) curatat = curatat.substring(0, 200);
     if (!curatat) return res.status(400).json({ eroare: "Text invalid." });
-    
+
     const prompt = `Estimează valorile nutriționale pentru 1 porție standard din: "${curatat}". RETURNEAZĂ STRICT UN OBIECT JSON în formatul: {"nume": "${curatat}", "calorii": 300, "proteine": 15, "carbohidrati": 30, "grasimi": 10, "gramajDefault": 150}. Fără text adițional.`;
-    
+
     const fetchPromise = fetch("https://api.groq.com/openai/v1/chat/completions", {
       method: "POST",
       headers: { "Authorization": `Bearer ${groqApiKey}`, "Content-Type": "application/json" },
@@ -881,7 +879,7 @@ RETURNEAZĂ STRICT EXCLUSIV UN OBIECT JSON valid în acest format:
                 payload: parsed,
                 updated_at: new Date().toISOString()
               });
-            } catch (sErr) {}
+            } catch (sErr) { }
 
             return res.json({ source: 'estimare_ai', produs: normalizedAi });
           }
@@ -947,11 +945,11 @@ app.post('/api/calculeaza-profil', requireAuth, async (req, res) => {
     } else {
       bmr = 10 * g + 6.25 * i - 5 * v - 161;
     }
-    
+
     // Corectare multiplicatori conform literaturii (B2)
     const multiplicatori = { 'Sedentar': 1.2, 'Moderat': 1.55, 'Foarte Activ': 1.725 };
     const tdee = bmr * (multiplicatori[activitate] || 1.2);
-    
+
     let caloriiTinta;
     if (obiectiv === 'Slăbire') {
       caloriiTinta = Math.max(tdee - 500, sex === 'Masculin' ? 1500 : 1200);
@@ -960,16 +958,16 @@ app.post('/api/calculeaza-profil', requireAuth, async (req, res) => {
     } else {
       caloriiTinta = tdee;
     }
-    
+
     const protPerKg = obiectiv === 'Menținere' ? 1.6 : 2.0;
     const proteineTinta = Math.round(g * protPerKg);
-    
+
     const calT = Math.round(caloriiTinta);
     const grasimiTinta = Math.round((calT * 0.25) / 9); // 25% din calorii, 9 kcal/g
     const carbiTinta = Math.round(Math.max((calT - (proteineTinta * 4) - (grasimiTinta * 9)) / 4, 50));
-    
+
     res.json({ caloriiTinta: calT, proteineTinta, grasimiTinta, carbiTinta });
-    
+
   } catch (error) {
     console.error("Eroare la calculul profilului:", error.message);
     res.status(500).json({ eroare: "Îmi pare rău, am întâmpinat o problemă la calcul. Mai încearcă!" });
@@ -1066,7 +1064,7 @@ const startKeepAliveTicker = (serverPort) => {
   if (ticker.unref) {
     ticker.unref();
   }
-  
+
   return ticker;
 };
 
